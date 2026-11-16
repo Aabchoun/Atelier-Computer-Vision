@@ -1,0 +1,96 @@
+# Fire Spread Simulator & Predictor - default configuration (local mode).
+# To experiment, create e.g. configs/my_run.yaml containing ONLY the keys you change;
+# it is merged on top of this file (python scripts/run_pipeline.py --config configs/my_run.yaml).
+# The common grid (CRS, extent, resolution) is not set here: it comes with each scene (scene.json).
+
+paths:
+  scenes: data/scenes
+  models: models
+  outputs: outputs
+
+agents:
+  # Remove a name to switch an agent off (ablation study). Execution order is fixed by the coordinator.
+  enabled: [fire, smoke, vegetation, burned_area, environment, spread, simulation]
+
+  fire:
+    checkpoint: null          # e.g. models/fire_unet.pt once trained (Landsat-8 Active Fire / Sen2Fire)
+    s2_confidence: 0.8        # replace with the validation F1 of your model
+    firms_confidence: 0.6     # FIRMS gives points, not perimeters
+    firms_min_confidence: 0.5 # drop low-confidence hotspots (VIIRS "l" = 0.3)
+    firms_concurrent_hours: 3 # FIRMS hotspots later than optical time + this are "new" (fire_firms_new)
+    # Baseline test: Murphy et al. 2016 (Landsat-8 TOA) adapted to Sentinel-2 L2A surface reflectance.
+    # 0.15 (paper) flags dark fresh char as fire; 0.25 keeps 96 % of the FIRMS-confirmed detections
+    # on Evros 2023 while removing 83 % of the unconfirmed cells (checked against same-day FIRMS).
+    swir2_min: 0.25
+    ratio_min: 1.4
+
+  smoke:
+    checkpoint: null          # e.g. models/smoke_unet.pt (USTC_SmokeRS pretraining + own S2 labels)
+    confidence: 0.4           # heuristic baseline -> low confidence
+    haze_red_coef: 0.5        # haze index = B2 - coef * B4 - offset
+    haze_offset: 0.08
+    haze_scale: 0.05
+    swir1_max: 0.30           # clouds are bright in SWIR, smoke is not
+
+  vegetation:
+    confidence: 0.7
+    ndvi_sparse: 0.3
+    ndvi_dense: 0.6
+    p_den: {sparse: -0.4, normal: 0.0, dense: 0.3}   # Alexandridis et al. 2008
+    # ESA WorldCover class -> p_veg (Alexandridis scale). Starting guesses: calibrate them.
+    # null = non-burnable.
+    p_veg:
+      10: 0.4     # tree cover
+      20: 0.0     # shrubland
+      30: -0.1    # grassland
+      40: -0.3    # cropland
+      50: null    # built-up
+      60: null    # bare / sparse vegetation
+      70: null    # snow and ice
+      80: null    # permanent water
+      90: -0.3    # herbaceous wetland
+      95: null    # mangroves
+      100: -0.3   # moss and lichen
+
+  burned_area:
+    checkpoint: null          # e.g. models/burned_unet.pt (CaBuAr)
+    confidence: 0.8
+    dnbr_threshold: 0.1       # USGS: dNBR >= 0.1 = burned (low severity); raise it to cut false positives
+    min_pre_ndvi: 0.15        # only vegetated pixels can burn (dNBR is noise over water / bare soil)
+
+  environment:
+    confidence: 0.9
+
+  spread:
+    model: persistence        # persistence | unet
+    checkpoint: null          # e.g. models/spread_unet.pt (Next Day Wildfire Spread / WildfireSpreadTS)
+    horizon_days: 1
+    confidence: 0.5
+
+  simulation:
+    horizon_days: 1
+    steps_per_day: 4          # CA steps per day: calibrate together with the cell size
+    n_runs: 30                # Monte Carlo runs -> probability map
+    seed: 0
+    confidence: 0.5
+    params: {p_h: 0.58, a: 0.078, c1: 0.045, c2: 0.131}   # paper values; recalibrate at 375 m
+
+coordinator:
+  strict: false               # true = an agent error stops the run (useful while developing)
+  fire_threshold: 0.5         # fused fire probability above which a cell is burning (shared with agents)
+  min_confidence: 0.2         # below this, or above max_cloud_fraction, fall back on the last known layer
+  max_cloud_fraction: 0.8
+  staleness_tau_days: 2.0     # source weight = confidence * exp(-age_days / tau)
+  accumulate_burned: true     # add the fire of previous runs to an older burned-area map (multi-day runs)
+  resampling:                 # how each layer is brought onto the common grid
+    default: mean
+    fire_s2: max
+    fire_firms: max
+    fire_firms_new: max
+    landcover: nearest
+    aspect: nearest
+  fusion:
+    disagreement_threshold: 0.4
+    risk_threshold: 0.5
+    built_up_risk_threshold: 0.3
+    wind_check_max_deg: 45

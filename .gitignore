@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Personal keys (FIRMS MAP_KEY, Earth Engine project): template in .env.example
+.env
+
+# Data, checkpoints and run outputs stay local (too big for Git)
+data/*
+!data/README.md
+models/*
+!models/.gitkeep
+outputs/*
+!outputs/.gitkeep
+*.pt
+*.ckpt
+
+# Experiment trackers
+wandb/
+mlruns/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

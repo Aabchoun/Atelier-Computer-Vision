@@ -1,0 +1,12 @@
+# Cellular automaton calibrated by scripts/calibrate_ca.py on 2026-11-12
+# sequence evros_2023, calibration days <= 2023-08-25: P=0.276 R=0.569 F1=0.372
+# test days: P=0.175 R=0.612 F1=0.272
+# Use: --config configs/evros_2023_calibrated.yaml
+agents:
+  simulation:
+    steps_per_day: 3
+    params:
+      p_h: 0.4
+      a: 0.078
+      c1: 0.1
+      c2: 0.131
