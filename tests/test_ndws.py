@@ -42,6 +42,15 @@ def test_convert_units_and_wind_direction():
     assert y.flat[2] == 1 and y.flat[3] == -1 and y.flat[0] == 0
 
 
+def test_corrupt_values_become_nan():
+    tmmx = np.full(TILE * TILE, 303.15)
+    tmmx[5] = 0.0  # fill value seen in the dataset
+    with np.errstate(all="raise"):  # no overflow / division warnings any more
+        layers, _ = convert_sample(raw_record(tmmx=tmmx))
+    assert np.isnan(layers["t2m"].flat[5]) and np.isnan(layers["rh"].flat[5])
+    assert np.isfinite(layers["rh"].flat[0])
+
+
 def test_relative_humidity_saturated():
     # q at saturation for 20 degC, sea level: about 0.0147 kg/kg
     rh = relative_humidity_from_q(np.array([0.0147]), np.array([20.0]), np.array([0.0]))

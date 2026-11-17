@@ -79,6 +79,13 @@ def main() -> None:
     mean = np.nanmean(x_train, axis=(0, 2, 3))
     std = np.nanstd(x_train, axis=(0, 2, 3))
     std = np.where(std > 1e-6, std, 1.0)
+    print("input statistics (train):")
+    for i, name in enumerate(inputs):
+        channel = x_train[:, i]
+        lo, hi = np.nanpercentile(channel, [1, 99])
+        print(f"  {name:10s} mean {mean[i]:9.3f}  std {std[i]:9.3f}  p1 {lo:9.3f}  p99 {hi:9.3f}  NaN {np.mean(np.isnan(channel)):.2%}")
+    if not np.all(np.isfinite(mean) & np.isfinite(std)):
+        raise ValueError("non-finite normalisation statistics: check the input layers above")
 
     def normalise(x: np.ndarray) -> torch.Tensor:
         x = (x - mean[None, :, None, None]) / std[None, :, None, None]

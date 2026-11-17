@@ -29,13 +29,28 @@ TILE = 64
 PIXEL_SIZE_M = 1000.0
 LAYERS = ("fire", "wind_u", "wind_v", "t2m", "rh", "elevation", "slope", "ndvi")
 SPLITS = ("train", "eval", "test")
+CACHE_VERSION = 2  # bump when convert_sample changes, so old caches are rebuilt
+
+# physically plausible range of each raw variable; anything outside becomes NaN (= "not observed")
+VALID_RANGE = {
+    "elevation": (-500.0, 9000.0),  # m
+    "vs": (0.0, 60.0),  # m/s
+    "th": (0.0, 360.0),  # deg
+    "tmmx": (213.15, 333.15),  # K (-60 .. +60 degC)
+    "sph": (0.0, 0.05),  # kg/kg
+    "NDVI": (-10000.0, 10000.0),  # NDVI * 1e4
+}
 
 
 def convert_sample(raw: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """One raw NDWS record -> ({layer: (64, 64) float32}, target (64, 64) float32 in {1, 0, -1})."""
 
     def get(name: str) -> np.ndarray:
-        return np.asarray(raw[name], dtype=np.float32).reshape(TILE, TILE)
+        value = np.asarray(raw[name], dtype=np.float32).reshape(TILE, TILE)
+        if name in VALID_RANGE:  # NDWS contains fill / corrupt values (e.g. tmmx ~ 0 K): -> NaN
+            low, high = VALID_RANGE[name]
+            value = np.where((value >= low) & (value <= high), value, np.nan)
+        return value
 
     prev = get("PrevFireMask")
     fire = np.where(prev < 0, np.nan, (prev > 0).astype(np.float32))
@@ -50,8 +65,7 @@ def convert_sample(raw: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], n
     slope, _ = slope_aspect(elevation, PIXEL_SIZE_M)
 
     ndvi = get("NDVI")
-    if np.nanmax(np.abs(ndvi)) > 2:  # stored as NDVI * 1e4
-        ndvi = ndvi / 1e4
+    ndvi = ndvi / 1e4  # stored as NDVI * 1e4
 
     layers = {
         "fire": fire,
@@ -104,11 +118,11 @@ def load_split(raw_dir: str | Path, split: str, cache_dir: str | Path | None = N
     cache = Path(cache_dir or Path(raw_dir) / "cache") / f"{split}.npz"
     if cache.exists():
         with np.load(cache) as npz:
-            if tuple(npz["layers"]) == LAYERS:
+            if tuple(npz["layers"]) == LAYERS and "version" in npz.files and int(npz["version"]) == CACHE_VERSION:
                 return npz["x"], npz["y"]
     x, y = read_split(raw_dir, split)
     cache.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(cache, x=x, y=y, layers=np.array(LAYERS))
+    np.savez(cache, x=x, y=y, layers=np.array(LAYERS), version=CACHE_VERSION)
     return x, y
 
 
