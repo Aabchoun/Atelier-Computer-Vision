@@ -86,8 +86,12 @@ class FireAgent(Agent):
             return predict_proba(model, x, meta.get("mean"), meta.get("std"))
 
         nir = s2["B8A"] if "B8A" in s2 else s2["B8"]
-        swir1, swir2 = s2["B11"], s2["B12"]
-        ratio = self.config.get("ratio_min", 1.4)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            fire = (swir2 >= self.config.get("swir2_min", 0.25)) & (swir2 / swir1 >= ratio) & (swir2 / nir >= ratio)
-        return fire.astype(np.float32)
+        return swir_fire_test(nir, s2["B11"], s2["B12"], self.config.get("swir2_min", 0.25), self.config.get("ratio_min", 1.4))
+
+
+def swir_fire_test(nir: np.ndarray, swir1: np.ndarray, swir2: np.ndarray, swir2_min: float = 0.25, ratio: float = 1.4) -> np.ndarray:
+    """Baseline active-fire mask (0/1 float32) from surface reflectance; also used as the benchmark
+    the trained fire U-Net must beat (scripts/train_fire.py)."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fire = (swir2 >= swir2_min) & (swir2 / swir1 >= ratio) & (swir2 / nir >= ratio)
+    return fire.astype(np.float32)

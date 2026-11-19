@@ -79,21 +79,39 @@ def load_checkpoint(path: str | Path, device: str = "cpu") -> tuple[Any, dict[st
     return model, {k: v for k, v in ckpt.items() if k != "state_dict"}
 
 
-def predict_proba(model, x: np.ndarray, mean=None, std=None, device: str = "cpu") -> np.ndarray:
+def predict_proba(model, x: np.ndarray, mean=None, std=None, device: str | None = None, tile: int = 512, overlap: int = 64) -> np.ndarray:
     """Probability map (H, W) for one (C, H, W) input. NaN inputs are set to the channel mean.
 
-    TODO(phase 2): tile large Sentinel-2 scenes (e.g. 512 x 512 windows with overlap).
+    Inputs larger than `tile` are processed in overlapping windows (averaged where they overlap),
+    so a full Sentinel-2 scene fits in memory. Uses the GPU when available unless `device` is set.
     """
     torch = _torch()
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     x = np.array(x, dtype=np.float32)
     if mean is not None and std is not None:
         x = (x - np.asarray(mean, np.float32)[:, None, None]) / np.asarray(std, np.float32)[:, None, None]
     x = np.nan_to_num(x, nan=0.0)
     _, h, w = x.shape
-    pad_h, pad_w = (-h) % 32, (-w) % 32  # U-Net needs sizes divisible by 32
-    tensor = torch.from_numpy(x)[None].to(device)
-    if pad_h or pad_w:
-        tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode="replicate")
-    with torch.no_grad():
-        prob = torch.sigmoid(model.to(device)(tensor))[0, 0, :h, :w]
-    return prob.cpu().numpy().astype(np.float32)
+    model = model.to(device).eval()
+
+    def run(window: np.ndarray) -> np.ndarray:
+        wh, ww = window.shape[1:]
+        pad_h, pad_w = (-wh) % 32, (-ww) % 32  # U-Net needs sizes divisible by 32
+        tensor = torch.from_numpy(np.ascontiguousarray(window))[None].to(device)
+        if pad_h or pad_w:
+            tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode="replicate")
+        with torch.no_grad():
+            return torch.sigmoid(model(tensor).float())[0, 0, :wh, :ww].cpu().numpy()
+
+    if h <= tile and w <= tile:
+        return run(x).astype(np.float32)
+
+    total = np.zeros((h, w), np.float32)
+    count = np.zeros((h, w), np.float32)
+    step = tile - overlap
+    for top in sorted({*range(0, max(h - tile, 0) + 1, step), max(h - tile, 0)}):
+        for left in sorted({*range(0, max(w - tile, 0) + 1, step), max(w - tile, 0)}):
+            window = x[:, top : top + tile, left : left + tile]
+            total[top : top + window.shape[1], left : left + window.shape[2]] += run(window)
+            count[top : top + window.shape[1], left : left + window.shape[2]] += 1
+    return total / np.maximum(count, 1)
