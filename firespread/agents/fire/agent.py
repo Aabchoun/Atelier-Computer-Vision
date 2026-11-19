@@ -11,6 +11,9 @@ from firespread.common.message import AgentMessage
 from firespread.common.scene import S2_POST, Raster, RawScene, SceneDatacube
 
 
+BAND_SUBSTITUTES = {"B8A": "B8", "B8": "B8A"}
+
+
 class FireAgent(Agent):
     """Outputs up to three layers, fused into the single `fire` layer by the coordinator:
 
@@ -82,7 +85,8 @@ class FireAgent(Agent):
             from firespread.common.nn import predict_proba
 
             model, meta = loaded
-            x = np.stack([s2[band] for band in meta["inputs"]])
+            # B8A (narrow NIR) is close to B8: substitute it when a scene does not provide it
+            x = np.stack([s2[band] if band in s2 else s2[BAND_SUBSTITUTES[band]] for band in meta["inputs"]])
             return predict_proba(model, x, meta.get("mean"), meta.get("std"))
 
         nir = s2["B8A"] if "B8A" in s2 else s2["B8"]
