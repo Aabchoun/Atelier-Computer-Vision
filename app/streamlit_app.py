@@ -5,6 +5,7 @@
 
 Tabs:
   Project         what the system does, the agents, which ones are trained
+  Analyse image   upload a Sentinel-2 image -> fire now + next-day spread forecast (weather from Open-Meteo)
   Full system     run the whole multi-agent pipeline on a synthetic scene (baseline or trained models)
   Spread model    next-day fire forecast on Next Day Wildfire Spread test tiles, with "what if" wind / weather
   Fire detection  active-fire detection on Sen2Fire test patches (or an uploaded .npz patch)
@@ -15,6 +16,7 @@ Tabs that need a trained model or a dataset explain what is missing instead of f
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
@@ -343,6 +345,121 @@ def tab_fire() -> None:
         st.dataframe(metrics_row(results), hide_index=True)
 
 
+@st.cache_data(show_spinner="Reading the image…", max_entries=4)
+def read_uploaded(files: tuple[tuple[str, bytes], ...]):
+    from firespread.image_pipeline import read_image
+
+    return read_image(list(files))
+
+
+@st.cache_data(show_spinner="Detecting fire…", max_entries=4)
+def detect_uploaded(files: tuple[tuple[str, bytes], ...], have_model: bool, swir2_min: float, ratio: float):
+    from firespread.image_pipeline import detect_fire
+
+    return detect_fire(read_uploaded(files), FIRE_CKPT if have_model else None, swir2_min, ratio)
+
+
+@st.cache_data(show_spinner="Downloading weather and terrain from Open-Meteo…", max_entries=8)
+def online_environment(files: tuple[tuple[str, bytes], ...], day):
+    from firespread.image_pipeline import cell_factor, fetch_elevation, fetch_weather
+
+    image = read_uploaded(files)
+    weather = fetch_weather(*image.center_lonlat(), day)
+    try:
+        elevation = fetch_elevation(image, cell_factor(image.resolution))
+    except Exception:  # noqa: BLE001 - terrain is optional
+        elevation = None
+    return weather, elevation
+
+
+def tab_image() -> None:
+    from firespread import image_pipeline as ip
+
+    st.markdown(
+        "Give the system **one satellite image** (Sentinel-2 L2A). The **fire agent** finds the active fire, "
+        "the image is turned into **1 km cells** (NDVI, fire), **weather and terrain** are added for that place and day, "
+        "and the **spread agent** forecasts where the fire will be tomorrow."
+    )
+    with st.expander("Where do I get an image?"):
+        st.markdown(
+            "1. Open **Copernicus Browser** (browser.dataspace.copernicus.eu, free account) and find a fire "
+            "(tip: the NASA FIRMS map shows where fires burned and when).\n"
+            "2. Pick a **Sentinel-2 L2A** date where the smoke plume is visible.\n"
+            "3. **Download → Analytical**: format **TIFF (32-bit float)**, bands **B02 B03 B04 B08 B8A B11 B12**, "
+            "high resolution. You get a .zip: upload it here as is.\n\n"
+            "Also accepted: one multi-band GeoTIFF, or a Sen2Fire .npz patch (not georeferenced: weather by hand)."
+        )
+    have_fire = FIRE_CKPT.exists() and torch_available()
+    have_spread = SPREAD_CKPT.exists() and torch_available()
+    if not (have_fire and have_spread):
+        st.info("Missing trained models are replaced by their baselines (SWIR test / persistence).")
+
+    source = st.radio("Image", ["Upload Sentinel-2 GeoTIFF(s) / .zip / .npz", "Sen2Fire test patch"], horizontal=True, key="img_source")
+    if source.startswith("Upload"):
+        uploads = st.file_uploader("Image file(s)", type=["zip", "tif", "tiff", "npz"], accept_multiple_files=True)
+        if not uploads:
+            return
+        files = tuple((u.name, u.getvalue()) for u in uploads)
+    else:
+        if not (SEN2FIRE_CACHE / "test_x.npy").exists():
+            st.warning("Sen2Fire is not available here (run scripts/train_fire.py on this machine first).")
+            return
+        x, y, order = sen2fire_test()
+        i = int(order[st.slider("Patch (sorted from most to least fire)", 0, len(order) - 1, 0, key="img_patch")])
+        buffer = io.BytesIO()
+        np.savez(buffer, image=np.asarray(x[i], np.float32), label=np.asarray(y[i], np.uint8))
+        files = ((f"sen2fire_test_{i}.npz", buffer.getvalue()),)
+    try:
+        image = read_uploaded(files)
+    except Exception as exc:  # noqa: BLE001 - show the reason to the user
+        st.error(f"Could not read the image: {exc}")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.write(f"**{image.shape[0]} × {image.shape[1]} px** at **{image.resolution:.0f} m** "
+             f"(≈ {image.shape[0] * image.resolution / 1000:.0f} × {image.shape[1] * image.resolution / 1000:.0f} km)")
+    center = image.center_lonlat()
+    c1.write(f"Centre: {center[1]:.3f}° N, {center[0]:.3f}° E" if center else "Not georeferenced")
+    day = c2.date_input("Acquisition date", value=image.date, key="img_date")
+    if not image.georeferenced:
+        image.resolution = c2.number_input("Pixel size (m)", 5.0, 100.0, float(image.resolution), 5.0)
+    threshold = c3.slider("Decision threshold", 0.05, 0.95, 0.5, 0.05, key="img_threshold")
+    days = c3.slider("Forecast days", 1, 5, 1, key="img_days")
+
+    online_ok = bool(center and day)
+    mode = st.radio("Weather and terrain", ["Open-Meteo (internet)", "By hand"] if online_ok else ["By hand"], horizontal=True, key="img_weather")
+    weather, elevation = None, None
+    if mode.startswith("Open-Meteo"):
+        try:
+            weather, elevation = online_environment(files, day)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Open-Meteo request failed ({exc}): give the weather by hand.")
+            return
+    w1, w2, w3, w4 = st.columns(4)
+    base = weather or ip.Weather(5.0, 0.0, 30.0, 25.0)
+    weather = ip.Weather(
+        w1.slider("Wind speed (m/s)", 0.0, 25.0, round(base.wind_speed, 1), 0.5, key=f"ws_{mode}_{day}"),
+        w2.slider("Wind from (°, 0 = north)", 0, 359, int(base.wind_from), 5, key=f"wd_{mode}_{day}"),
+        w3.slider("Max temperature (°C)", -10.0, 50.0, round(base.t2m, 1), 0.5, key=f"t_{mode}_{day}"),
+        w4.slider("Min humidity (%)", 0, 100, int(base.rh), 1, key=f"rh_{mode}_{day}"),
+        source=base.source if weather else "manual",
+    )
+    st.caption(f"Weather source: {weather.source} (move the sliders to test other conditions)")
+
+    cfg = load_config()["agents"]["fire"]
+    fire_prob, fire_method = detect_uploaded(files, have_fire, cfg["swir2_min"], cfg["ratio_min"])
+    with st.spinner("Forecasting the spread…"):
+        result = ip.analyse(image, spread_model=SPREAD_CKPT if have_spread else None, weather=weather, elevation=elevation,
+                            fire_prob=fire_prob.copy(), fire_method=fire_method, threshold=threshold, days=days, online=False)
+    show_day = st.select_slider("Show forecast day", list(range(1, days + 1)), value=days, key="img_show_day") if days > 1 else 1
+    st.pyplot(ip.figure(image, result, day=show_day))
+    st.caption("Last panel: red = fire now, coloured area = forecast probability, yellow = cells predicted to catch fire."
+               + (" Cyan on the fire panel = Sen2Fire label." if image.label is not None else ""))
+    st.dataframe([{"": k, "value": str(v)} for k, v in result.summary().items()], hide_index=True)
+    for note in result.notes:
+        st.caption(f"Note: {note}")
+
+
 LOG_LINE = re.compile(r"epoch\s+(\d+)/\d+\s+loss ([\d.]+)\s+val P ([\d.]+) R ([\d.]+) F1 ([\d.]+) AUC-PR ([\d.]+)")
 
 
@@ -383,14 +500,7 @@ def tab_training() -> None:
 
 
 st.title("🔥 Fire Spread Simulator & Predictor")
-tabs = st.tabs(["Project", "Full system", "Spread model", "Fire detection", "Training"])
-with tabs[0]:
-    tab_project()
-with tabs[1]:
-    tab_full_system()
-with tabs[2]:
-    tab_spread()
-with tabs[3]:
-    tab_fire()
-with tabs[4]:
-    tab_training()
+tabs = st.tabs(["Project", "Analyse an image", "Full system", "Spread model", "Fire detection", "Training"])
+for tab, render in zip(tabs, [tab_project, tab_image, tab_full_system, tab_spread, tab_fire, tab_training]):
+    with tab:
+        render()
