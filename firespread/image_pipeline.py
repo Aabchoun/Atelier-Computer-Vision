@@ -6,13 +6,16 @@
 Steps (each one is an agent of the full system, run on the uploaded image only):
   1. fire       fire probability at the image resolution: trained fire U-Net, else the SWIR baseline
   2. 1 km grid  the spread model was trained on 1 km cells (Next Day Wildfire Spread), so the image is
-                aggregated: fire = at least one fire pixel in the cell, NDVI = mean of the cell
+                aggregated: fire = at least `min_fire_pixels` fire pixels in the cell (isolated pixels are
+                mostly false alarms: bright roofs, greenhouses), NDVI = mean of the cell
   3. weather    wind, daily max temperature and min humidity (the variables of the training data) for the
                 image date, from Open-Meteo (free, no key, needs internet), or given by hand
      terrain    elevation of every 1 km cell from the Open-Meteo elevation API (Copernicus DEM), slope from it;
                 without it the model gets the training mean (flat terrain)
   4. spread     next-day fire probability: trained spread U-Net (several days = applied again on its own
                 forecast), else persistence ("tomorrow = today")
+  5. simulation physics-based forecast from the same 1 km layers: Alexandridis cellular automaton
+                (Monte Carlo), fuel density from NDVI, non-burnable where NDVI < 0.15 (water, town, burn scar)
 
 Images: Copernicus Browser (browser.dataspace.copernicus.eu) -> Sentinel-2 L2A -> Download -> Analytical,
 TIFF 32-bit float, bands B02 B03 B04 B08 B8A B11 B12. One file per band (band name in the file name)
@@ -335,6 +338,7 @@ class Result:
     weather: Weather
     threshold: float
     notes: list[str]
+    simulation: np.ndarray | None = None  # P(cell burning during the last forecast day), cellular automaton
 
     @property
     def fire_cells(self) -> np.ndarray:
@@ -354,19 +358,39 @@ class Result:
             mask = prob >= self.threshold
             out[f"day +{d}: cells on fire (km²)"] = round(float(mask.sum() * km2), 1)
             out[f"day +{d}: new cells (km²)"] = round(float((mask & ~(self.fire_cells >= 0.5)).sum() * km2), 1)
+        if self.simulation is not None:
+            out[f"simulation day +{len(self.spread)}: cells burning with P >= 0.5 (km²)"] = round(float((self.simulation >= 0.5).sum() * km2), 1)
         return out
+
+
+def simulate_spread(layers: dict[str, np.ndarray], days: int, threshold: float = 0.5, config: dict[str, Any] | None = None) -> np.ndarray:
+    """Cellular-automaton forecast (simulation agent) on the 1 km layers: P(burning during the last day)."""
+    from firespread.agents.simulation.cellular_automaton import CAParams, initial_state, run_monte_carlo, spread_probabilities
+
+    config = config or {}
+    ndvi = np.nan_to_num(layers["ndvi"], nan=0.0)
+    burnable = (ndvi >= 0.15).astype(np.float32)
+    p_den = np.select([ndvi < 0.3, ndvi > 0.6], [-0.4, 0.3], 0.0).astype(np.float32)  # Alexandridis density classes
+    elevation = layers["elevation"]
+    elevation = np.where(np.isfinite(elevation), elevation, np.nanmean(elevation) if np.isfinite(elevation).any() else 0.0)
+    state0 = initial_state(layers["fire"], np.zeros_like(ndvi), burnable, threshold)
+    probs = spread_probabilities(np.zeros_like(ndvi), p_den, elevation, layers["wind_u"], layers["wind_v"], CELL_M, CAParams(**config.get("params", {})))
+    return run_monte_carlo(state0, probs, days, int(config.get("steps_per_day", 4)), int(config.get("n_runs", 30)), int(config.get("seed", 0))).active_prob
 
 
 def analyse(image: SatImage, fire_model: str | Path | None = None, spread_model: str | Path | None = None,
             weather: Weather | None = None, elevation: np.ndarray | None = None, fire_prob: np.ndarray | None = None,
             fire_method: str = "given", threshold: float = 0.5, days: int = 1, online: bool = True,
-            swir2_min: float = 0.25, ratio: float = 1.4) -> Result:
+            swir2_min: float = 0.25, ratio: float = 1.4, simulate: bool = True, sim_config: dict[str, Any] | None = None,
+            min_fire_pixels: int = 3) -> Result:
     notes = list(image.notes)
     if fire_prob is None:
         fire_prob, fire_method = detect_fire(image, fire_model, swir2_min, ratio)
 
     factor = cell_factor(image.resolution)
-    fire = block_reduce(np.where(np.isnan(fire_prob), np.nan, (fire_prob >= threshold).astype(np.float32)), factor, "max")
+    fire_px = np.where(np.isnan(fire_prob), np.nan, (fire_prob >= threshold).astype(np.float32))
+    n_fire = block_reduce(fire_px, factor, "mean") * factor**2  # fire pixels per cell (valid pixels only)
+    fire = np.where(np.isnan(n_fire), np.nan, (n_fire >= min(min_fire_pixels, factor**2) - 1e-3).astype(np.float32))
     with np.errstate(divide="ignore", invalid="ignore"):
         nir, red = image.band("B8"), image.band("B4")
         ndvi = np.clip((nir - red) / (nir + red), -1, 1)
@@ -421,7 +445,8 @@ def analyse(image: SatImage, fire_model: str | Path | None = None, spread_model:
     else:
         spread = [np.nan_to_num(fire)] * days
         spread_method = "persistence (no spread model)"
-    return Result(fire_prob, fire_method, factor, layers, spread, spread_method, weather, threshold, notes)
+    simulation = simulate_spread(layers, days, threshold, sim_config) if simulate else None
+    return Result(fire_prob, fire_method, factor, layers, spread, spread_method, weather, threshold, notes, simulation)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -433,7 +458,7 @@ def stretch(rgb: np.ndarray) -> np.ndarray:
 
 
 def figure(image: SatImage, result: Result, day: int = 1):
-    """Five panels: true colour, infrared, fire probability, 1 km inputs, forecast over the image."""
+    """Panels: true colour, infrared, fire probability, 1 km inputs, forecast, simulation (when run)."""
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
 
@@ -441,11 +466,12 @@ def figure(image: SatImage, result: Result, day: int = 1):
     rgb = stretch(np.stack([image.band("B4"), image.band("B3"), image.band("B2")]))
     ir = stretch(np.stack([image.band("B12"), image.band("B8A"), image.band("B4")]))
     today = upsample(np.nan_to_num(result.fire_cells), result.factor, shape)
-    tomorrow = upsample(result.spread[day - 1], result.factor, shape)
-    new = (tomorrow >= result.threshold) & (today < 0.5)
+    forecasts = [(f"Day +{day}: {result.spread_method.split(' (')[0]}", result.spread[day - 1])]
+    if result.simulation is not None:
+        forecasts.append((f"Day +{len(result.spread)}: simulation (CA)", result.simulation))
 
-    fig = Figure(figsize=(17, 4))
-    axes = fig.subplots(1, 5)
+    fig = Figure(figsize=(3.4 * (4 + len(forecasts)), 4))
+    axes = fig.subplots(1, 4 + len(forecasts))
     axes[0].imshow(rgb)
     axes[0].set_title("True colour (B4 B3 B2)")
     axes[1].imshow(ir)
@@ -461,15 +487,18 @@ def figure(image: SatImage, result: Result, day: int = 1):
     axes[3].quiver([w / 2], [h / 2], [result.weather.uv[0]], [result.weather.uv[1]], color="black", scale=40, width=0.02)
     axes[3].set_title("1 km cells: NDVI, fire, wind")
 
-    axes[4].imshow(rgb)
-    axes[4].imshow(np.ma.masked_where(tomorrow < 0.05, tomorrow), cmap="autumn_r", vmin=0, vmax=1, alpha=0.55)
-    if today.max() > 0:
-        axes[4].contour(today, levels=[0.5], colors="red", linewidths=1.2)
-    if new.any():
-        axes[4].contour(new.astype(float), levels=[0.5], colors="yellow", linewidths=1.2)
-    axes[4].set_title(f"Day +{day}: {result.spread_method.split(' (')[0]}")
-    axes[4].legend(handles=[Line2D([], [], color="red", label="fire now"), Line2D([], [], color="yellow", label="new tomorrow")],
-                   loc="lower right", fontsize=8)
+    for ax, (title, prob) in zip(axes[4:], forecasts):
+        big = upsample(prob, result.factor, shape)
+        new = (big >= result.threshold) & (today < 0.5)
+        ax.imshow(rgb)
+        ax.imshow(np.ma.masked_where(big < 0.05, big), cmap="autumn_r", vmin=0, vmax=1, alpha=0.55)
+        if today.max() > 0:
+            ax.contour(today, levels=[0.5], colors="red", linewidths=1.2)
+        if new.any():
+            ax.contour(new.astype(float), levels=[0.5], colors="yellow", linewidths=1.2)
+        ax.set_title(title)
+    axes[-1].legend(handles=[Line2D([], [], color="red", label="fire now"), Line2D([], [], color="yellow", label="new tomorrow")],
+                    loc="lower right", fontsize=8)
     for ax in axes:
         ax.set_xticks([]), ax.set_yticks([])
     fig.tight_layout()

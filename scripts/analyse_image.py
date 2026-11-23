@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--resolution", type=float, default=None, help="pixel size in m (default: from the GeoTIFF)")
     parser.add_argument("--days", type=int, default=1, help="forecast horizon in days")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--min-fire-pixels", type=int, default=3, help="fire pixels needed to call a 1 km cell burning")
     parser.add_argument("--wind-speed", type=float, default=None, help="m/s (manual weather: give all four)")
     parser.add_argument("--wind-from", type=float, default=None, help="deg, direction the wind comes from (0 = north)")
     parser.add_argument("--t2m", type=float, default=None, help="daily max temperature, degC")
@@ -57,7 +58,8 @@ def main() -> None:
     print(f"Image {image.name}: {image.shape[0]} x {image.shape[1]} px at {image.resolution:.1f} m, bands {sorted(image.bands)}, "
           f"date {image.date}, centre {image.center_lonlat()}")
     result = ip.analyse(image, resolve_path(args.fire_model), resolve_path(args.spread_model), weather=weather,
-                        threshold=args.threshold, days=args.days, online=not args.offline,
+                        sim_config=load_config()["agents"]["simulation"],
+                        threshold=args.threshold, min_fire_pixels=args.min_fire_pixels, days=args.days, online=not args.offline,
                         swir2_min=cfg["swir2_min"], ratio=cfg["ratio_min"])
     for key, value in result.summary().items():
         print(f"  {key}: {value}")

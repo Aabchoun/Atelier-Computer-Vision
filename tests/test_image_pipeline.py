@@ -63,6 +63,7 @@ def test_read_geotiff_zip_and_analyse_offline():
     assert result.fire_cells.shape == (4, 6)
     assert np.nansum(result.fire_cells) >= 1  # the hot spot is found
     assert len(result.spread) == 2
+    assert result.simulation.shape == (4, 6) and result.simulation.max() > 0  # the CA spreads from the hot spot
     assert "burning cells today (1 km²)" in result.summary()
     ip.figure(image, result)
 
